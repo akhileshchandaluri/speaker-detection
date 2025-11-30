@@ -1,92 +1,129 @@
-"""
-SpeakerDiarizer
-A thin, reusable wrapper around pyannote.audio 3.1
-------------------------------------------------------------------
-Usage
------
-from speaker_diarizer import SpeakerDiarizer
-dia = SpeakerDiarizer(hf_token="YOUR_HUGGINGFACE_TOKEN")
-segments = dia(waveform, sample_rate=16_000)
-# segments -> [(start, end, speaker_label), ...]
-"""
+# speaker_diarizer.py
+import os
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+from dotenv import load_dotenv
 
-import torch
-from pyannote.audio import Pipeline
-import numpy as np
-from typing import List, Tuple
+# Load variables from .env file
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
+# Don't raise error at import time - allow token to be passed via constructor
+
+try:
+    import torchaudio
+    TORCHAUDIO_AVAILABLE = True
+except Exception:
+    TORCHAUDIO_AVAILABLE = False
+
+try:
+    from pyannote.audio import Pipeline
+    PYANNOTE_AVAILABLE = True
+except Exception:
+    PYANNOTE_AVAILABLE = False
 
 
 class SpeakerDiarizer:
-    """
-    1. Loads the pyannote speaker-diarization-3.1 model once
-    2. Accepts mono or stereo numpy arrays (float32 [-1, 1] or int16)
-    3. Returns list of (start, end, speaker) tuples in seconds
-    """
+    def __init__(self, hf_token: str | None = None):
+        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
+        self.pipeline = None
 
-    def __init__(
-        self,
-        hf_token: str,
-        device: str = None,
-        min_segment_duration: float = 0.2,
-    ):
-        """
-        Parameters
-        ----------
-        hf_token : str
-            HuggingFace access token with permissions for pyannote models.
-        device : str, optional
-            'cpu', 'cuda', 'cuda:0', etc.  Auto-detected if None.
-        min_segment_duration : float
-            Discard segments shorter than this (seconds) to reduce chatter.
-        """
-        self.min_segment_duration = min_segment_duration
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        if not PYANNOTE_AVAILABLE:
+            print("[WARNING] pyannote.audio not installed — diarization unavailable.")
+            return
 
-        self.pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization@2.1",
-            use_auth_token=hf_token,
-        ).to(self.device)
+        print("[INFO] Attempting to load pyannote pipeline...")
+        try:
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=self.hf_token
+            )
+            print("[INFO] pyannote pipeline loaded.")
+        except Exception as e:
+            print(f"[WARNING] Could not load pyannote pipeline: {e}")
+            self.pipeline = None
 
-    # ------------------------------------------------------------------ #
-    def __call__(
-        self,
-        waveform: np.ndarray,
-        sample_rate: int,
-    ) -> List[Tuple[float, float, str]]:
-        """
-        Run diarization.
-
-        Parameters
-        ----------
-        waveform : np.ndarray
-            Shape (samples,) for mono or (channels, samples) for multi-channel.
-            Values float32 in [-1, 1] or int16 in [-32768, 32767].
-        sample_rate : int
-            Sample rate of `waveform`.
-
-        Returns
-        -------
-        segments : list[tuple]
-            (start_time, end_time, speaker_label) in seconds.
-        """
-        # --- 1. Convert to mono float32 tensor ------------------------ #
-        if waveform.ndim == 2:
-            waveform = waveform.mean(axis=0)  # simple mono mix
-        if waveform.dtype == np.int16:
-            waveform = waveform.astype(np.float32) / 32768.0
-        waveform = torch.from_numpy(waveform).unsqueeze(0).to(self.device)
-
-        # --- 2. Run pyannote pipeline -------------------------------- #
-        diarization = self.pipeline(
-            {"waveform": waveform, "sample_rate": sample_rate}
-        )
-
-        # --- 3. Flatten to list and filter short segments ------------ #
-        segments = [
-            (turn.start, turn.end, speaker)
-            for turn, _, speaker in diarization.itertracks(yield_label=True)
-            if turn.end - turn.start >= self.min_segment_duration
+    def extract_audio(self, video_path: str) -> str:
+        """Extract mono 16 kHz WAV using ffmpeg; return wav path."""
+        video = Path(video_path)
+        wav_path = video.with_suffix(".wav")
+        cmd = [
+            "ffmpeg", "-y", "-i", str(video),
+            "-ar", "16000", "-ac", "1", str(wav_path)
         ]
+        print(f"[INFO] Running ffmpeg to extract audio -> {wav_path}")
+        subprocess.run(cmd, check=True)
+        return str(wav_path)
+
+    def load_audio_as_tensor(self, wav_path: str) -> Dict[str, Any]:
+        """Return dict {'waveform': tensor_or_numpy, 'sample_rate': int}"""
+        if TORCHAUDIO_AVAILABLE:
+            try:
+                waveform, sample_rate = torchaudio.load(wav_path)
+                return {"waveform": waveform, "sample_rate": int(sample_rate)}
+            except Exception as e:
+                print(f"[WARNING] torchaudio.load failed: {e}")
+
+        import soundfile as sf
+        import numpy as np
+        data, sr = sf.read(wav_path, dtype="float32")
+        if data.ndim == 1:
+            data = np.expand_dims(data, 0)
+        else:
+            data = data.T
+        try:
+            import torch
+            tensor = torch.from_numpy(data)
+            return {"waveform": tensor, "sample_rate": int(sr)}
+        except Exception:
+            return {"waveform": data, "sample_rate": int(sr)}
+
+    def diarize(self, video_path: str) -> List[Tuple[float, float, str]]:
+        """Extract audio, run diarization, return list of (start,end,label) with overlapping speech support."""
+        if self.pipeline is None:
+            print("[WARNING] No diarization pipeline available — returning empty list.")
+            return []
+
+        wav_path = self.extract_audio(video_path)
+        audio_dict = self.load_audio_as_tensor(wav_path)
+
+        print("[INFO] Running diarization with overlapping speech detection...")
+        try:
+            # Run diarization - pyannote 3.1 supports overlapping speech natively
+            diarization = self.pipeline(audio_dict)
+        except Exception as e:
+            print(f"[ERROR] Diarization pipeline call failed: {e}")
+            return []
+
+        segments = []
+        try:
+            # pyannote 3.1 outputs include overlapping segments
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append((turn.start, turn.end, speaker))
+        except Exception:
+            # fallback for dict/list output
+            try:
+                for record in diarization:
+                    start = record.get("start") or record.get("start_time") or record["start"]
+                    end = record.get("end") or record.get("end_time") or record["end"]
+                    label = record.get("label") or record.get("speaker") or record.get("entity")
+                    segments.append((start, end, label))
+            except Exception:
+                print("[WARNING] Could not parse diarization output format.")
+
+        print(f"[INFO] Diarization complete: {len(segments)} segments (including overlaps).")
+        
+        # Log overlapping segments for debugging
+        overlaps = 0
+        for i, (s1, e1, sp1) in enumerate(segments):
+            for s2, e2, sp2 in segments[i+1:]:
+                if s2 < e1 and sp1 != sp2:  # Overlap detected
+                    overlaps += 1
+                    print(f"[DEBUG] Overlap detected: {sp1} ({s1:.2f}-{e1:.2f}) overlaps with {sp2} ({s2:.2f}-{e2:.2f})")
+        
+        if overlaps > 0:
+            print(f"[INFO] Found {overlaps} overlapping speech segments.")
+        else:
+            print("[INFO] No overlapping speech detected by diarization model.")
+        
         return segments

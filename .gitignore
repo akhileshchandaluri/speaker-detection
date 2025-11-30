@@ -1,4 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
 .venv/
-.vscode/
-token.txt
+env/
+ENV/
+
+# Output files
+*.mp4
+*.wav
+*.avi
+*.mov
 Output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sensitive
+token.txt
+
+# OS
+.DS_Store
+Thumbs.db
