@@ -16,6 +16,7 @@ HF_TOKEN_ENV = os.getenv("HF_TOKEN")
 
 from speaker_diarizer import SpeakerDiarizer
 from kalman_tracker import MultiObjectTracker
+from crop_engine import CropEngine
 
 import mediapipe as mp
 import numpy as np
@@ -82,6 +83,7 @@ def main():
     parser.add_argument("--sample-fps", type=float, default=2.0, help="Sampling fps (frames/sec)")
     parser.add_argument("--token", dest="hf_token", help="HF token (optional for gated models)")
     parser.add_argument("--map", dest="speaker_map", help="Manual speaker mapping (e.g., 'SPEAKER_00:left,SPEAKER_01:right')")
+    parser.add_argument("--crop", choices=["none", "9:16", "4:3"], default="none", help="Crop ratio: 'none' (draw boxes), '9:16' (vertical), '4:3' (standard)")
     args = parser.parse_args()
 
     input_path = Path(args.input_video)
@@ -270,10 +272,31 @@ def main():
     cap.release()
     print(f"[INFO] Tracked {len(left_boxes)} frames for left person, {len(right_boxes)} frames for right person.")
 
-    # ------------------------- Second Pass: Select active speaker box per frame -------------------------
+    # ------------------------- Second Pass: Write output with crop or boxes -------------------------
     tmp_video = output_path.with_suffix(".noaudio.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out_writer = cv2.VideoWriter(str(tmp_video), fourcc, fps, (width, height))
+    
+    # Determine output dimensions based on crop mode
+    if args.crop == "9:16":
+        # Vertical video for mobile
+        out_width = int(height * 9 / 16)
+        out_height = height
+        crop_engine = CropEngine(fps=fps, smooth_alpha=0.08, max_velocity=0.03, margin_ratio=0.3, aspect_ratio="9:16")
+        print(f"[INFO] Cropping to 9:16 vertical format: {out_width}x{out_height}")
+    elif args.crop == "4:3":
+        # Standard 4:3 format
+        out_width = int(height * 4 / 3)
+        out_height = height
+        crop_engine = CropEngine(fps=fps, smooth_alpha=0.08, max_velocity=0.03, margin_ratio=0.25, aspect_ratio="4:3")
+        print(f"[INFO] Cropping to 4:3 format: {out_width}x{out_height}")
+    else:
+        # No crop - full frame with boxes
+        out_width = width
+        out_height = height
+        crop_engine = None
+        print(f"[INFO] Drawing boxes on full frame: {out_width}x{out_height}")
+    
+    out_writer = cv2.VideoWriter(str(tmp_video), fourcc, fps, (out_width, out_height))
 
     cap = cv2.VideoCapture(str(input_path))
     frame_idx = 0
@@ -284,8 +307,6 @@ def main():
         if not ret:
             break
         
-        frame_to_write = frame.copy()
-        
         # Determine ALL active speakers at this timestamp (support overlapping speech)
         t_sec = timestamp_to_sec(frame_idx, fps)
         active_speakers = []
@@ -293,8 +314,10 @@ def main():
             if s <= t_sec <= e:
                 active_speakers.append(label)
         
-        # Draw boxes for ALL active speakers (supports simultaneous speech)
+        # Get the primary active speaker's box for cropping
+        primary_box = None
         boxes_to_draw = []
+        
         for speaker in active_speakers:
             if speaker in speaker_to_position_idx:
                 pos_idx = speaker_to_position_idx[speaker]
@@ -306,30 +329,47 @@ def main():
                 
                 if box is not None:
                     boxes_to_draw.append((box, speaker))
+                    if primary_box is None:  # First active speaker becomes primary for crop
+                        primary_box = box
         
-        # Draw all valid bounding boxes
-        for box, speaker_label in boxes_to_draw:
-            x1, y1, x2, y2 = box
+        # Process frame based on crop mode
+        if crop_engine and primary_box:
+            # CROP MODE: Center crop on active speaker
+            yslice, xslice = crop_engine.update(primary_box, (height, width))
+            cropped_frame = frame[yslice, xslice]
             
-            # Validate box is reasonable (not empty, not out of bounds)
-            box_width = x2 - x1
-            box_height = y2 - y1
+            # Resize to output dimensions if needed
+            if cropped_frame.shape[1] != out_width or cropped_frame.shape[0] != out_height:
+                frame_to_write = cv2.resize(cropped_frame, (out_width, out_height))
+            else:
+                frame_to_write = cropped_frame
+        else:
+            # BOX MODE or no active speaker: Draw boxes on full frame
+            frame_to_write = frame.copy()
             
-            # Skip invalid boxes (too small, negative size, or completely out of frame)
-            if box_width > 10 and box_height > 10 and x2 > 0 and y2 > 0 and x1 < width and y1 < height:
-                # Clamp to frame bounds
-                x1 = max(0, min(int(x1), width - 1))
-                y1 = max(0, min(int(y1), height - 1))
-                x2 = max(x1 + 1, min(int(x2), width))
-                y2 = max(y1 + 1, min(int(y2), height))
+            # Draw all valid bounding boxes
+            for box, speaker_label in boxes_to_draw:
+                x1, y1, x2, y2 = box
                 
-                # Draw green bounding box
-                cv2.rectangle(frame_to_write, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                # Validate box is reasonable (not empty, not out of bounds)
+                box_width = x2 - x1
+                box_height = y2 - y1
                 
-                # Add speaker label
-                label_text = f"Speaking: {speaker_label}"
-                cv2.putText(frame_to_write, label_text, (x1, max(y1 - 10, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                # Skip invalid boxes (too small, negative size, or completely out of frame)
+                if box_width > 10 and box_height > 10 and x2 > 0 and y2 > 0 and x1 < width and y1 < height:
+                    # Clamp to frame bounds
+                    x1 = max(0, min(int(x1), width - 1))
+                    y1 = max(0, min(int(y1), height - 1))
+                    x2 = max(x1 + 1, min(int(x2), width))
+                    y2 = max(y1 + 1, min(int(y2), height))
+                    
+                    # Draw green bounding box
+                    cv2.rectangle(frame_to_write, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                    
+                    # Add speaker label
+                    label_text = f"Speaking: {speaker_label}"
+                    cv2.putText(frame_to_write, label_text, (x1, max(y1 - 10, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         
         out_writer.write(frame_to_write)
         frame_idx += 1

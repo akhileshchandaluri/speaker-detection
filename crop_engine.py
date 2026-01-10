@@ -20,10 +20,21 @@ class CropEngine:
         smooth_alpha: float = 0.05,
         max_velocity: float = 0.05,   # 5 % of frame width/height per frame
         margin_ratio: float = 0.20,   # extra margin around box
+        aspect_ratio: str = "9:16"    # "9:16" for vertical, "4:3" for standard, "16:9" for wide
     ):
         self.alpha = smooth_alpha
         self.max_vel = max_velocity
         self.margin = margin_ratio
+        
+        # Parse aspect ratio
+        if aspect_ratio == "9:16":
+            self.aspect_w, self.aspect_h = 9, 16
+        elif aspect_ratio == "4:3":
+            self.aspect_w, self.aspect_h = 4, 3
+        elif aspect_ratio == "16:9":
+            self.aspect_w, self.aspect_h = 16, 9
+        else:
+            raise ValueError(f"Unsupported aspect ratio: {aspect_ratio}")
 
         # internal state
         self.cx: float = None
@@ -54,9 +65,9 @@ class CropEngine:
         box_w = (x2 - x1) * (1 + self.margin)
         box_h = (y2 - y1) * (1 + self.margin)
 
-        # 2. 9:16 aspect
-        crop_h = max(box_h, box_w * 16 / 9)   # width dominates
-        crop_w = crop_h * 9 / 16              # height = width * 16/9
+        # 2. Calculate crop dimensions based on aspect ratio
+        crop_w = max(box_w, box_h * self.aspect_w / self.aspect_h)
+        crop_h = max(box_h, box_w * self.aspect_h / self.aspect_w)
 
         target_scale = min(W / crop_w, H / crop_h)  # >1 means zoom-in
 

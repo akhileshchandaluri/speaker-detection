@@ -25,6 +25,12 @@ Output/
 
 # Sensitive
 token.txt
+.env
+
+# Logs and temporary files
+*.log
+*.txt
+job_*.txt
 
 # OS
 .DS_Store
